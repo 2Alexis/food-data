@@ -1,0 +1,31 @@
+# Ignorer les données (Règle du projet : data/ n'est jamais versionné)
+data/
+*.parquet
+*.jsonl
+
+# Ignorer les secrets et variables d'environnement
+.env
+.env.local
+
+# Bases de données locales & fichiers temporaires
+*.db
+*.sqlite
+*.duckdb
+*.duckdb.wal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Checkpoints d'ingestion locaux
+.checkpoint*
+checkpoint.json
+
+# IDE
+.vscode/
+.idea/
