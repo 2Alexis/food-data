@@ -7,7 +7,8 @@ from pathlib import Path
 from scripts.load_sql import (
     SQLDatabaseManager,
     create_schema,
-    load_parquet_idempotent
+    load_parquet_idempotent,
+    run_explain_analyze_benchmark
 )
 
 
@@ -84,22 +85,18 @@ def test_explain_analyze_index_gain(test_db):
     create_schema(test_db, schema_file)
     load_parquet_idempotent(test_db, processed_dir)
 
-    query = """
-    EXPLAIN ANALYZE
-    SELECT p.code, p.product_name, n.sugars_100g
-    FROM products p
-    JOIN product_nutrition n ON p.code = n.product_code
-    WHERE p.nutriscore_grade = 'A' AND n.sugars_100g <= 5.0;
-    """
+    # Volume réduit (100 copies, 144 700 lignes) pour garder le test rapide :
+    # on vérifie le changement de plan, pas un temps (trop variable en CI).
+    result = run_explain_analyze_benchmark(test_db, factor=100, runs=3, verbose=False)
 
-    # Exécution avant index
-    res_before = test_db.execute(query).fetchall()
-    assert len(res_before) > 0
-
-    # Création des index
-    test_db.execute("CREATE INDEX idx_test_nutriscore ON products(nutriscore_grade);")
-    test_db.execute("CREATE INDEX idx_test_sugars ON product_nutrition(sugars_100g);")
-
-    # Exécution après index
-    res_after = test_db.execute(query).fetchall()
-    assert len(res_after) > 0
+    assert result["rows"] == 100 * test_db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    assert result["result_rows"] == 1
+    assert result["before"]["scan_types"] == ["Sequential Scan"]
+    assert result["after"]["scan_types"] == ["Index Scan"]
+    # Sans index tous les blocs sont lus, avec index aucun
+    lus, total = result["before"]["row_groups"][0].split(" / ")
+    assert lus == total
+    assert result["after"]["row_groups"][0].startswith("0 / ")
+    # La table de démonstration est supprimée après la mesure
+    tables = [r[0] for r in test_db.execute("SHOW TABLES;").fetchall()]
+    assert "products_volume" not in tables

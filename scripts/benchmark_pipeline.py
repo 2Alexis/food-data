@@ -1,29 +1,38 @@
 """
 Script de Mesure et Benchmark du Pipeline de Données
 =====================================================
-Génère les métriques chiffrées précises exigées pour la soutenance finale (10 min) :
-- Volumes disques (JSON Lines brut vs Parquet compressé Snappy) et taux de compression
-- Durées et débits de traitement
-- Empreinte mémoire RAM maximale (via tracemalloc)
-- Gain d'optimisation de l'index validé par EXPLAIN ANALYZE
+Génère les métriques chiffrées demandées pour la soutenance finale (10 min) :
+- Volumes disques (JSON Lines brut vs Parquet compressé Snappy) et taux de réduction
+- Durée et pic mémoire de la transformation réelle (tracemalloc, sortie dans un dossier temporaire)
+- Durée du chargement SQL et de sa relance (idempotence)
+- Gain d'un index validé par EXPLAIN ANALYZE (plan, blocs lus, temps moteur)
 """
 
-import os
 import sys
 import time
+import tempfile
 import tracemalloc
 from pathlib import Path
-import pyarrow.parquet as pq
 
 # Inclusion du chemin racine
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-from scripts.load_sql import SQLDatabaseManager, create_schema, load_parquet_idempotent
+from scripts.load_sql import (  # noqa: E402
+    SQLDatabaseManager,
+    create_schema,
+    load_parquet_idempotent,
+    run_explain_analyze_benchmark,
+)
+from scripts.transform.clean_and_transform import transform_pipeline  # noqa: E402
 
 
 def get_dir_size(path: Path, pattern: str = "*") -> int:
     return sum(f.stat().st_size for f in path.glob(pattern) if f.is_file())
+
+
+def fmt_int(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
 
 
 def run_benchmark():
@@ -35,82 +44,65 @@ def run_benchmark():
     print(" MESURES ET BENCHMARK DU PIPELINE (CHIFFRES POUR LA PRÉSENTATION)")
     print("=" * 80)
 
-    # 1. Mesures de volumes
-    raw_size_bytes = get_dir_size(raw_dir, "*.jsonl")
-    raw_files_count = len(list(raw_dir.glob("*.jsonl")))
-    processed_size_bytes = get_dir_size(processed_dir, "*.parquet")
-    processed_files_count = len(list(processed_dir.glob("*.parquet")))
+    # 1. Volumes
+    raw_size = get_dir_size(raw_dir, "*.jsonl")
+    raw_count = len(list(raw_dir.glob("*.jsonl")))
+    raw_lines = sum(1 for f in raw_dir.glob("*.jsonl") for _ in open(f, encoding="utf-8"))
+    parquet_size = get_dir_size(processed_dir, "*.parquet")
+    parquet_count = len(list(processed_dir.glob("*.parquet")))
+    unified_size = (processed_dir / "products_cleaned.parquet").stat().st_size
+    reduction = (1.0 - parquet_size / max(raw_size, 1)) * 100.0
 
-    compression_ratio = (1.0 - (processed_size_bytes / max(raw_size_bytes, 1))) * 100.0
+    print("\n1. VOLUMÉTRIE :")
+    print(f"   - JSON Lines bruts : {raw_count} fichiers, {fmt_int(raw_lines)} lignes, {raw_size / 1024**2:.2f} Mo")
+    print(f"   - Parquet (5 tables) : {parquet_count} fichiers, {parquet_size / 1024:.0f} Ko "
+          f"(table unifiée seule : {unified_size / 1024:.0f} Ko)")
+    print(f"   - Réduction : {reduction:.1f} % (Snappy + déduplication + colonnes non conservées)")
 
-    print("\n1. VOLUMÉTRIE ET COMPRESSION DES DONNÉES :")
-    print(f"   - Fichiers bruts (JSON Lines) : {raw_files_count} fichiers | {raw_size_bytes / (1024*1024):.2f} Mo ({raw_size_bytes:,} octets)")
-    print(f"   - Fichiers nettoyés (Parquet) : {processed_files_count} fichiers | {processed_size_bytes / 1024:.2f} Ko ({processed_size_bytes:,} octets)")
-    print(f"   - Taux de réduction d'espace disque : {compression_ratio:.1f}% de gain d'espace !")
+    # 2. Transformation réelle, écrite dans un dossier temporaire
+    print("\n2. TRANSFORMATION (exécution réelle, sortie temporaire) :")
+    with tempfile.TemporaryDirectory() as tmp:
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        stats = transform_pipeline(raw_dir, Path(tmp), chunk_size=500)
+        duration_s = time.perf_counter() - t0
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+    dup = raw_lines - stats["unique_products"]
+    print(f"   - Durée : {duration_s:.2f} s, {stats['total_chunks_streamed']} lots de 500")
+    print(f"   - Pic mémoire Python (tracemalloc) : {peak / 1024**2:.1f} Mo")
+    print(f"   - {fmt_int(raw_lines)} lignes -> {fmt_int(stats['unique_products'])} produits uniques "
+          f"({fmt_int(dup)} doublons, {100 * dup / max(raw_lines, 1):.1f} %), "
+          f"{stats['unique_brands']} marques, {stats['unique_categories']} catégories")
+    print("   - Note : la table unifiée est écrite lot par lot ; les tables produits/nutrition")
+    print("     et l'ensemble des codes vus restent en mémoire jusqu'à la fin (croissance linéaire).")
 
-    # 2. Mesures RAM et Transformation
-    tracemalloc.start()
-    start_time = time.perf_counter()
-
-    # Lecture d'un chunk pour évaluer l'empreinte de streaming
-    unified_table = pq.read_table(processed_dir / "products_cleaned.parquet")
-    num_rows = unified_table.num_rows
-
-    current_mem, peak_mem = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-
-    print("\n2. EMPREINTE MÉMOIRE ET TRAITEMENT PAR LOTS :")
-    print(f"   - Nombre total de produits uniques nettoyés : {num_rows:,}")
-    print(f"   - Pic d'utilisation mémoire RAM (streaming) : {peak_mem / (1024*1024):.2f} Mo")
-    print(f"   - Efficacité : Mémoire bornée O(1) grâce au flux de chunking sans débordement RAM")
-
-    # 3. Benchmark Base SQL et Gain d'Index
-    print("\n3. PERFORMANCE SQL ET GAIN DE L'INDEXATION (EXPLAIN ANALYZE) :")
+    # 3. Chargement SQL
+    print("\n3. CHARGEMENT SQL (DuckDB en mémoire) :")
     db = SQLDatabaseManager(db_type="duckdb", db_path=":memory:")
     create_schema(db, schema_path)
-    load_parquet_idempotent(db, processed_dir)
+    t0 = time.perf_counter()
+    counts_1 = load_parquet_idempotent(db, processed_dir)
+    load_ms = (time.perf_counter() - t0) * 1000.0
+    t0 = time.perf_counter()
+    counts_2 = load_parquet_idempotent(db, processed_dir)
+    reload_ms = (time.perf_counter() - t0) * 1000.0
+    print(f"   - Premier chargement : {load_ms:.0f} ms | relance : {reload_ms:.0f} ms | "
+          f"comptages identiques : {counts_1 == counts_2} {counts_1}")
 
-    test_query = """
-    SELECT p.code, p.product_name, n.sugars_100g, n.energy_kcal
-    FROM products p
-    JOIN product_nutrition n ON p.code = n.product_code
-    WHERE p.nutriscore_grade IN ('A', 'B')
-      AND n.sugars_100g <= 5.0
-      AND n.energy_kcal BETWEEN 50 AND 400
-    ORDER BY n.proteins_100g DESC NULLS LAST
-    LIMIT 25;
-    """
-
-    # Mesure avant index (moyenne sur 10 exécutions)
-    times_before = []
-    for _ in range(10):
-        t0 = time.perf_counter()
-        db.execute(test_query).fetchall()
-        times_before.append((time.perf_counter() - t0) * 1000.0)
-    avg_before_ms = sum(times_before) / len(times_before)
-
-    # Création des index
-    t0_idx = time.perf_counter()
-    db.execute("CREATE INDEX idx_bench_nutriscore ON products(nutriscore_grade, category_id);")
-    db.execute("CREATE INDEX idx_bench_sugars ON product_nutrition(sugars_100g, energy_kcal);")
-    idx_build_ms = (time.perf_counter() - t0_idx) * 1000.0
-
-    # Mesure après index (moyenne sur 10 exécutions)
-    times_after = []
-    for _ in range(10):
-        t0 = time.perf_counter()
-        db.execute(test_query).fetchall()
-        times_after.append((time.perf_counter() - t0) * 1000.0)
-    avg_after_ms = sum(times_after) / len(times_after)
-
-    gain = avg_before_ms / max(avg_after_ms, 0.001)
-
-    print(f"   - Temps d'exécution moyen SANS index : {avg_before_ms:.3f} ms (Scan séquentiel complet)")
-    print(f"   - Temps de création des index B-Tree : {idx_build_ms:.2f} ms")
-    print(f"   - Temps d'exécution moyen AVEC index : {avg_after_ms:.3f} ms (Scan indexé ciblé)")
-    print(f"   - Facteur d'accélération mesuré : x{gain:.2f} plus rapide !")
-
+    # 4. Index
+    print("\n4. GAIN D'INDEX (EXPLAIN ANALYZE, recherche par code-barres) :")
+    r = run_explain_analyze_benchmark(db, verbose=False)
+    b, a = r["before"], r["after"]
+    print(f"   - Volume de test : {fmt_int(r['rows'])} lignes ({r['factor']} copies mélangées des produits réels)")
+    print(f"   - SANS index : {', '.join(b['scan_types'])}, blocs lus {', '.join(b['row_groups'])}, "
+          f"moteur {b['engine_ms']:.1f} ms, médiane {b['median_ms']:.2f} ms")
+    print(f"   - AVEC index : {', '.join(a['scan_types'])}, blocs lus {', '.join(a['row_groups'])}, "
+          f"moteur {a['engine_ms']:.1f} ms, médiane {a['median_ms']:.2f} ms")
+    print(f"   - Création de l'index : {r['index_ms']:.0f} ms")
+    print(f"   - Gain : x{r['gain_engine']:.1f} (moteur), x{r['gain_median']:.1f} (de bout en bout)")
     db.close()
+
     print("\n" + "=" * 80)
     print(" Tous les chiffres mesurés sont prêts pour les diapositives de la soutenance.")
     print("=" * 80 + "\n")

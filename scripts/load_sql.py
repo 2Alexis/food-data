@@ -4,14 +4,18 @@ Chargement et Analyse SQL du Pipeline de Données
 Respecte l'ensemble des attendus du sujet :
 - Schéma relationnel strict avec clés primaires, clés étrangères, contraintes CHECK et NOT NULL.
 - Chargement idempotent pouvant être relancé indéfiniment sans provoquer de doublons (ON CONFLICT / UPSERT).
-- Support natif de DuckDB (in-memory ou fichier local) et de PostgreSQL / Supabase via DATABASE_URL.
+- Chargement DuckDB (in-memory ou fichier local). La connexion PostgreSQL / Supabase via DATABASE_URL
+  est prévue, mais le chargement des Parquet n'est implémenté que pour DuckDB.
 - Exécution automatisée des 5 requêtes d'analyse avancées (Jointures, GROUP BY, CTE, Window Functions).
-- Analyse comparative de performance avec EXPLAIN ANALYZE avant / après indexation.
+- Analyse comparative avec EXPLAIN ANALYZE avant / après création d'un index sur le code-barres,
+  mesurée sur une table agrandie par réplication (products_volume).
 """
 
 import os
+import re
 import sys
 import time
+import statistics
 import logging
 import argparse
 from pathlib import Path
@@ -145,7 +149,7 @@ def load_parquet_idempotent(db: SQLDatabaseManager, processed_dir: Path) -> Dict
     return counts
 
 
-def run_analytical_queries(db: SQLDatabaseManager, sql_dir: Path) -> None:
+def run_analytical_queries(db: SQLDatabaseManager, sql_dir: Path, index_volume_factor: int = 1000) -> None:
     """Exécute les 5 requêtes d'analyse et affiche les résultats formatés."""
     query_files = [
         ("Requête 1 - Window Ranking (Top 3 kcal / catégorie)", sql_dir / "01_window_ranking.sql"),
@@ -184,69 +188,130 @@ def run_analytical_queries(db: SQLDatabaseManager, sql_dir: Path) -> None:
     print("\n" + "=" * 80)
     print(" REQUÊTE 5 : OPTIMISATION ET JUSTIFICATION D'INDEX (EXPLAIN ANALYZE)")
     print("=" * 80)
-    run_explain_analyze_benchmark(db)
+    if db.db_type != "duckdb":
+        print("Démonstration d'index prévue pour DuckDB : lancer sql/05_optimization_explain_analyze.sql à la main.")
+        return
+    run_explain_analyze_benchmark(db, factor=index_volume_factor)
 
 
-def run_explain_analyze_benchmark(db: SQLDatabaseManager) -> None:
-    """Mesure rigoureusement le gain de performance d'un index via EXPLAIN ANALYZE."""
-    test_query = """
-    SELECT
-        p.code,
-        p.product_name,
-        b.name AS marque,
-        c.name AS categorie,
-        p.nutriscore_grade,
-        n.sugars_100g,
-        n.proteins_100g,
-        n.energy_kcal
-    FROM products p
-    JOIN product_nutrition n ON p.code = n.product_code
-    JOIN brands b ON p.brand_id = b.id
-    JOIN categories c ON p.category_id = c.id
-    WHERE p.nutriscore_grade IN ('A', 'B')
-      AND n.sugars_100g <= 5.0
-      AND n.energy_kcal BETWEEN 50 AND 400
-    ORDER BY n.proteins_100g DESC NULLS LAST
-    LIMIT 25;
+# ----------------------------------------------------------------------------
+# Démonstration d'index (requête 5)
+# ----------------------------------------------------------------------------
+# Constat de départ : avec 1 447 produits, DuckDB lit toute la table en moins d'une
+# milliseconde et ses index ART ne servent pas aux filtres IN ou par plage. Les
+# anciens index composites (nutriscore_grade, sugars_100g...) ne changeaient pas
+# le plan. On mesure donc l'index sur le cas qu'il sert vraiment : la recherche
+# d'un produit par code-barres, sur une table agrandie par réplication.
+
+INDEX_DEMO_FACTOR = 1000
+
+
+def build_volume_table(db: SQLDatabaseManager, factor: int = INDEX_DEMO_FACTOR) -> int:
+    """Crée products_volume : chaque produit réel répliqué `factor` fois avec un code
+    suffixé, lignes mélangées (sinon DuckDB élague déjà les blocs grâce à l'ordre)."""
+    if not 1 <= factor <= 9999:
+        raise ValueError("factor doit être compris entre 1 et 9999")
+    db.execute("DROP TABLE IF EXISTS products_volume;")
+    db.execute(f"""
+        CREATE TABLE products_volume AS
+        SELECT p.code || lpad(k::VARCHAR, 4, '0') AS code,
+               p.product_name, p.brand_id, p.category_id, p.nutriscore_grade, p.nova_group
+        FROM products p, range({int(factor)}) AS t(k)
+        ORDER BY hash(p.code, k);
+    """)
+    return db.execute("SELECT COUNT(*) FROM products_volume").fetchone()[0]
+
+
+def index_demo_query(db: SQLDatabaseManager, factor: int) -> str:
+    """Recherche d'un produit par code-barres, sur un code réel choisi de façon déterministe."""
+    n = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    base = db.execute(f"SELECT code FROM products ORDER BY code LIMIT 1 OFFSET {n // 2}").fetchone()[0]
+    target = base + str(factor // 2).zfill(4)
+    return f"""
+    SELECT code, product_name, nutriscore_grade, nova_group
+    FROM products_volume
+    WHERE code = '{target}';
     """
 
-    # 1. Supprimer l'index s'il existe pour tester l'état initial
-    try:
-        db.execute("DROP INDEX IF EXISTS idx_products_nutriscore_cat;")
-        db.execute("DROP INDEX IF EXISTS idx_nutrition_sugars_energy;")
-    except Exception:
-        pass
 
-    # 2. Plan et timing SANS index
-    start_no_idx = time.perf_counter()
-    res_no_idx = db.execute(f"EXPLAIN ANALYZE {test_query}").fetchall()
-    duration_no_idx_ms = (time.perf_counter() - start_no_idx) * 1000.0
+def explain_profile(db: SQLDatabaseManager, query: str) -> Dict[str, Any]:
+    """Lance EXPLAIN ANALYZE (DuckDB) et extrait le type de scan, les blocs lus et le temps moteur."""
+    text = db.execute("EXPLAIN ANALYZE " + query).fetchall()[0][1]
+    total = re.search(r"Total Time: ([\d.]+)s", text)
+    return {
+        "plan": text,
+        "scan_types": re.findall(r"Type: (Sequential Scan|Index Scan)", text),
+        "row_groups": re.findall(r"Row Groups Scanned: (\d+ / \d+)", text),
+        "engine_ms": float(total.group(1)) * 1000.0 if total else None,
+    }
 
-    print("\n[PLAN D'EXÉCUTION SANS INDEX]")
-    for line in res_no_idx[:4]:
-        print(" ", line[0] if isinstance(line, (list, tuple)) else line)
-    print(f"--> Durée mesurée SANS index : {duration_no_idx_ms:.2f} ms")
 
-    # 3. Création des index
-    start_create_idx = time.perf_counter()
-    db.execute("CREATE INDEX idx_products_nutriscore_cat ON products (nutriscore_grade, category_id);")
-    db.execute("CREATE INDEX idx_nutrition_sugars_energy ON product_nutrition (sugars_100g, energy_kcal);")
-    idx_creation_time = (time.perf_counter() - start_create_idx) * 1000.0
-    print(f"\n[CRÉATION DES INDEX B-TREE] (Temps de création : {idx_creation_time:.2f} ms)")
+def median_ms(db: SQLDatabaseManager, query: str, runs: int = 30) -> float:
+    """Temps médian de bout en bout (appel Python compris) sur `runs` exécutions, après un essai à blanc."""
+    db.execute(query).fetchall()
+    samples = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        db.execute(query).fetchall()
+        samples.append((time.perf_counter() - t0) * 1000.0)
+    return statistics.median(samples)
 
-    # 4. Plan et timing AVEC index
-    start_with_idx = time.perf_counter()
-    res_with_idx = db.execute(f"EXPLAIN ANALYZE {test_query}").fetchall()
-    duration_with_idx_ms = (time.perf_counter() - start_with_idx) * 1000.0
 
-    print("\n[PLAN D'EXÉCUTION AVEC INDEX]")
-    for line in res_with_idx[:4]:
-        print(" ", line[0] if isinstance(line, (list, tuple)) else line)
-    print(f"--> Durée mesurée AVEC index : {duration_with_idx_ms:.2f} ms")
+def run_explain_analyze_benchmark(
+    db: SQLDatabaseManager,
+    factor: int = INDEX_DEMO_FACTOR,
+    runs: int = 30,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Mesure le gain d'un index sur products_volume(code) avant / après, via EXPLAIN ANALYZE."""
+    t0 = time.perf_counter()
+    rows = build_volume_table(db, factor)
+    build_ms = (time.perf_counter() - t0) * 1000.0
+    query = index_demo_query(db, factor)
 
-    gain = duration_no_idx_ms / max(duration_with_idx_ms, 0.01)
-    print(f"\n[SYNTHÈSE OPTIMISATION] Gain de vitesse estimé : x{gain:.1f}")
-    print("=" * 80 + "\n")
+    # Médiane d'abord (elle fait un essai à blanc), puis EXPLAIN ANALYZE à chaud
+    before_median = median_ms(db, query, runs)
+    before = explain_profile(db, query)
+    before["median_ms"] = before_median
+
+    t0 = time.perf_counter()
+    db.execute("CREATE INDEX idx_products_volume_code ON products_volume (code);")
+    index_ms = (time.perf_counter() - t0) * 1000.0
+
+    after_median = median_ms(db, query, runs)
+    after = explain_profile(db, query)
+    after["median_ms"] = after_median
+    result_rows = db.execute(query).fetchall()
+
+    db.execute("DROP TABLE IF EXISTS products_volume;")
+
+    summary = {
+        "rows": rows,
+        "factor": factor,
+        "build_ms": build_ms,
+        "index_ms": index_ms,
+        "before": before,
+        "after": after,
+        "result_rows": len(result_rows),
+        "gain_engine": (before["engine_ms"] / after["engine_ms"]) if before["engine_ms"] and after["engine_ms"] else None,
+        "gain_median": before["median_ms"] / max(after["median_ms"], 1e-6),
+    }
+
+    if verbose:
+        rows_txt = f"{rows:,}".replace(",", " ")
+        print(f"\nTable products_volume : {rows_txt} lignes ({factor} copies mélangées des produits réels), "
+              f"créée en {build_ms:.0f} ms")
+        print("Requête : recherche d'un produit par code-barres (WHERE code = ...)")
+        for label, prof in (("SANS index", before), ("AVEC index", after)):
+            print(f"\n[{label}] Scan : {', '.join(prof['scan_types']) or '?'} | "
+                  f"blocs lus : {', '.join(prof['row_groups']) or '?'} | "
+                  f"temps moteur (EXPLAIN ANALYZE) : {prof['engine_ms']:.1f} ms | "
+                  f"médiane sur {runs} exécutions : {prof['median_ms']:.2f} ms")
+        print(f"\nCréation de idx_products_volume_code : {index_ms:.0f} ms")
+        print(f"[SYNTHÈSE] Gain moteur x{summary['gain_engine']:.1f} | gain de bout en bout x{summary['gain_median']:.1f} "
+              f"| {len(result_rows)} ligne(s) retournée(s)")
+        print("=" * 80 + "\n")
+    return summary
 
 
 def main():
@@ -261,6 +326,8 @@ def main():
                         help="Exécuter automatiquement les requêtes d'analyse")
     parser.add_argument("--idempotent-test", action="store_true",
                         help="Tester le rechargement consécutif pour prouver l'idempotence")
+    parser.add_argument("--index-volume-factor", type=int, default=INDEX_DEMO_FACTOR,
+                        help="Nombre de copies des produits pour la démonstration d'index (défaut : 1000)")
 
     args = parser.parse_args()
 
@@ -291,7 +358,7 @@ def main():
 
         # 4. Requêtes d'analyse & optimisation
         if args.run_queries:
-            run_analytical_queries(db, sql_path)
+            run_analytical_queries(db, sql_path, index_volume_factor=args.index_volume_factor)
 
     finally:
         db.close()
