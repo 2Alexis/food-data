@@ -117,7 +117,8 @@ food-data-pipeline/
 - Script automatisé utilisant `huggingface_hub`.
 - Dépôt configuré comme **privé par défaut** (`private=True`) pendant le développement.
 - Version taguée explicitement : **`v1.0.0`**.
-- Dataset Card complète et conforme générée automatiquement avec métadonnées YAML et mention de la licence **ODbL**.
+- Dataset Card complète et conforme générée automatiquement avec métadonnées YAML et mention de la licence **ODbL** (identifiant Hub : `odbl`).
+- **Jeu de données publié** : [huggingface.co/datasets/Axis22L/openfoodfacts-france-processed](https://huggingface.co/datasets/Axis22L/openfoodfacts-france-processed), dépôt privé, tag `v1.0.0` (5 fichiers Parquet + Dataset Card).
 
 ---
 

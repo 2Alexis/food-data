@@ -49,7 +49,7 @@ def generate_dataset_card_content(
 language:
 - fr
 - en
-license: odc-odbl
+license: odbl
 task_categories:
 - tabular-classification
 - tabular-regression
